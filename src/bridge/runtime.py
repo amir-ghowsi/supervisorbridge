@@ -480,21 +480,20 @@ class RuntimeEngine:
                 TaskState.IMPLEMENTER_RESPONSE_DETECTED,
                 TaskState.IMPLEMENTER_RESPONSE_VALIDATED,
             ):
-                # Check PREPARED retry record reconciliation BEFORE evaluating general state
-                # Search both current task.retry_count AND task.retry_count + 1
-                retry_key_curr = f"idem_retry_{task.task_id}_{task.phase}_{task.retry_count}_{task.command_sha256}"
-                retry_key_next = f"idem_retry_{task.task_id}_{task.phase}_{task.retry_count + 1}_{task.command_sha256}"
-                existing_retry_rec = self.safety.idempotency.get_record(retry_key_curr) or self.safety.idempotency.get_record(retry_key_next)
+                # Search for any unfinished PREPARED retry record belonging to the active task
+                existing_prepared_retry = self.safety.idempotency.get_unfinished_prepared_record(
+                    task_id=task.task_id, operation_type="GEMINI_RETRY"
+                )
 
                 gen_state, gen_details = await self.monitor.detect_state(aistudio_page)
 
-                if existing_retry_rec and existing_retry_rec.state == "PREPARED":
+                if existing_prepared_retry:
                     if gen_state in (GenerationState.GENERATING, GenerationState.COMPLETED):
                         self.safety.idempotency.record_operation(
                             session_id=task.session_id,
                             task_id=task.task_id,
-                            operation_id=existing_retry_rec.operation_id,
-                            idempotency_key=existing_retry_rec.idempotency_key,
+                            operation_id=existing_prepared_retry.operation_id,
+                            idempotency_key=existing_prepared_retry.idempotency_key,
                             command_sha256=task.command_sha256,
                             operation_type="GEMINI_RETRY",
                             state="CONFIRMED",

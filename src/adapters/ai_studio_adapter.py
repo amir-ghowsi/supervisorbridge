@@ -119,13 +119,21 @@ class AIStudioAdapter(BaseAdapter):
             return None
 
     async def extract_latest_response_text(self) -> str:
-        """Extracts text content of the latest model turn in DOM order."""
+        """Extracts text content of the latest model/assistant turn in DOM order (excluding user prompts)."""
         sel = self.selectors.get("ai_studio", {})
         turns_selector = sel.get("conversation_turns", "div.turn")
         try:
+            # First attempt explicit model turn selectors
+            model_turns = await self.page.query_selector_all("ms-chat-turn.model-turn, div.model-turn, ms-chat-turn[data-role='model'], div[data-role='model']")
+            if model_turns:
+                return await model_turns[-1].inner_text()
+
+            # Fallback: Scan general turns in reverse, excluding submitted user commands
             turns = await self.page.query_selector_all(turns_selector)
-            if turns:
-                return await turns[-1].inner_text()
+            for turn in reversed(turns):
+                text = await turn.inner_text()
+                if text and "[SUPERVISOR]" not in text and "<<<SUPERVISOR_BRIDGE_COMMAND>>>" not in text:
+                    return text
         except Exception as e:
             self.logger.error(f"Failed to extract latest AI Studio response text: {e}")
         return ""

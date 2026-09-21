@@ -242,7 +242,7 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         retry_op_id = f"op_retry_TASK-900_1_{retry_attempt}"
         retry_idem_key = f"idem_retry_TASK-900_1_{retry_attempt}_{cmd_sha}"
 
-        # Record retry_count=1 on task matching production disk write prior to click crash
+        # Production state: task.retry_count = 1 saved on disk when attempt 1 is prepared/attempted
         task = ActiveTaskData(
             schema_version=CURRENT_SCHEMA_VERSION,
             task_id="TASK-900",
@@ -259,7 +259,7 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         )
         self.repo.save_active_task(task)
 
-        # Simulate process crash: PREPARED retry record written but click confirmation failed
+        # Record PREPARED retry operation in idempotency records
         self.safety.idempotency.record_operation(
             session_id="sess-900",
             task_id="TASK-900",
@@ -332,7 +332,7 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         loop_ctrl = LoopController(runtime=self.runtime)
         loop_ctrl.poll_interval_sec = 0.001
 
-        # Run 5 iterations
+        # Run 5 iterations cleanly
         await loop_ctrl.run_loop(dry_run=False, max_cycles=5)
 
     # Scenarios 13-17: Identity field mismatches fail closed

@@ -4,7 +4,7 @@ import time
 import tempfile
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from src.utils.paths import ensure_dir
 from src.utils.logger import get_logger
 
@@ -25,7 +25,7 @@ class IdempotencyRecord:
     operation_id: str
     idempotency_key: str
     command_sha256: str
-    operation_type: str  # e.g., "GEMINI_SUBMISSION", "SUPERVISOR_RETURN"
+    operation_type: str  # e.g., "GEMINI_SUBMISSION", "SUPERVISOR_RETURN", "GEMINI_RETRY"
     state: str  # "PREPARED", "EXECUTED", "CONFIRMED", "FAILED"
     created_at: float
     updated_at: float
@@ -91,6 +91,29 @@ class IdempotencyManager:
         raw = records.get(idempotency_key)
         if raw:
             return IdempotencyRecord.from_dict(raw)
+        return None
+
+    def get_unfinished_prepared_record(
+        self, task_id: str, operation_type: str = "GEMINI_RETRY"
+    ) -> Optional[IdempotencyRecord]:
+        """
+        Searches durable idempotency records for any unfinished PREPARED operation for a given task_id and operation_type.
+        If multiple conflicting PREPARED records exist, raises IdempotencyViolationError (fails closed).
+        """
+        records = self.load_records()
+        matches = []
+        for raw in records.values():
+            rec = IdempotencyRecord.from_dict(raw)
+            if rec.task_id == task_id and rec.operation_type == operation_type and rec.state == "PREPARED":
+                matches.append(rec)
+
+        if len(matches) > 1:
+            raise IdempotencyViolationError(
+                f"Multiple conflicting PREPARED '{operation_type}' records found for task '{task_id}'! Failing closed."
+            )
+
+        if matches:
+            return matches[0]
         return None
 
     def record_operation(
