@@ -41,6 +41,14 @@ class ReconciliationEngine:
         """
         Reconciles SUBMISSION_PREPARED state.
         Checks if expected Supervisor command was submitted to AI Studio.
+
+        Strict Rules:
+        1. Completed ledger contains task -> PROVEN_COMPLETED
+        2. Positive matching turn in AI Studio -> PROVEN_EXECUTED
+        3. Idempotency record is CONFIRMED -> PROVEN_EXECUTED
+        4. Idempotency record is PREPARED -> INSUFFICIENT_EVIDENCE (PREPARED + empty/no DOM evidence is ambiguous, fails closed)
+        5. Checkpoint exists -> INSUFFICIENT_EVIDENCE
+        6. PROVEN_NOT_EXECUTED ONLY if no idempotency PREPARED record exists AND no checkpoint exists.
         """
         try:
             ledger = self.repo.load_completed_ledger()
@@ -56,14 +64,25 @@ class ReconciliationEngine:
                     return ReconciliationOutcome.PROVEN_EXECUTED
 
         rec = self.idempotency.get_record(task.idempotency_key)
-        if rec and rec.state == "CONFIRMED":
-            return ReconciliationOutcome.PROVEN_EXECUTED
+        if rec:
+            if rec.state == "CONFIRMED":
+                return ReconciliationOutcome.PROVEN_EXECUTED
+            if rec.state == "PREPARED":
+                return ReconciliationOutcome.INSUFFICIENT_EVIDENCE
 
-        # If no idempotency record / checkpoint AND zero turns exist in conversation -> PROVEN_NOT_EXECUTED
-        if (not rec or rec.state != "CONFIRMED") and (ai_studio_turns is not None and len(ai_studio_turns) == 0):
+        ckpt = self.checkpoint.load_checkpoint()
+        if ckpt:
+            return ReconciliationOutcome.INSUFFICIENT_EVIDENCE
+
+        # PROVEN_NOT_EXECUTED if no PREPARED record and no checkpoint exist
+        if not rec and not ckpt and task.get_state_enum() in (
+            TaskState.COMMAND_DETECTED,
+            TaskState.COMMAND_VALIDATED,
+            TaskState.COMMAND_ACCEPTED,
+            TaskState.SUBMISSION_PREPARED,
+        ):
             return ReconciliationOutcome.PROVEN_NOT_EXECUTED
 
-        # Absence alone in non-empty conversation does not prove non-execution -> Fail closed with INSUFFICIENT_EVIDENCE
         return ReconciliationOutcome.INSUFFICIENT_EVIDENCE
 
     def reconcile_return_prepared(
@@ -75,6 +94,13 @@ class ReconciliationEngine:
         """
         Reconciles RETURN_PREPARED state or ambiguous return click.
         Checks if Implementer Report was already posted to ChatGPT in a USER-role message.
+
+        Strict Rules:
+        1. Completed ledger contains task -> PROVEN_COMPLETED
+        2. Positive matching USER message in ChatGPT -> PROVEN_EXECUTED
+        3. Idempotency record is CONFIRMED -> PROVEN_EXECUTED
+        4. Idempotency record is PREPARED -> INSUFFICIENT_EVIDENCE
+        5. Checkpoint exists -> INSUFFICIENT_EVIDENCE
         """
         try:
             ledger = self.repo.load_completed_ledger()
@@ -89,10 +115,21 @@ class ReconciliationEngine:
                     return ReconciliationOutcome.PROVEN_EXECUTED
 
         rec = self.idempotency.get_record(f"idem_return_{task.task_id}_{task.phase}_{task.command_sha256}")
-        if rec and rec.state == "CONFIRMED":
-            return ReconciliationOutcome.PROVEN_EXECUTED
+        if rec:
+            if rec.state == "CONFIRMED":
+                return ReconciliationOutcome.PROVEN_EXECUTED
+            if rec.state == "PREPARED":
+                return ReconciliationOutcome.INSUFFICIENT_EVIDENCE
 
-        if (not rec or rec.state != "CONFIRMED") and (chatgpt_user_messages is not None and len(chatgpt_user_messages) == 0):
+        ckpt = self.checkpoint.load_checkpoint()
+        if ckpt:
+            return ReconciliationOutcome.INSUFFICIENT_EVIDENCE
+
+        if not rec and not ckpt and task.get_state_enum() in (
+            TaskState.IMPLEMENTER_RESPONSE_DETECTED,
+            TaskState.IMPLEMENTER_RESPONSE_VALIDATED,
+            TaskState.RETURN_PREPARED,
+        ):
             return ReconciliationOutcome.PROVEN_NOT_EXECUTED
 
         return ReconciliationOutcome.INSUFFICIENT_EVIDENCE

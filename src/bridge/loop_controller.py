@@ -14,7 +14,7 @@ class LoopController:
         self.logger = get_logger()
         self.runtime = runtime or RuntimeEngine()
         cfg = get_config()
-        self.poll_interval_sec = cfg.settings.get("polling", {}).get("interval_sec", 2.0)
+        self.poll_interval_sec = cfg.settings.get("polling", {}) .get("interval_sec", 2.0)
         self.loop_guard = LoopGuard()
 
     async def run_loop(self, dry_run: bool = False, max_cycles: Optional[int] = None) -> None:
@@ -31,9 +31,14 @@ class LoopController:
             try:
                 result = await self.runtime.run_once(dry_run=dry_run)
 
-                # Record operation signature with loop guard to detect infinite repeated identical operations
-                op_sig = result.get("IDEMPOTENCY_KEY") or result.get("ACTION_TAKEN", "NONE")
-                self.loop_guard.record_cycle(operation_signature=op_sig)
+                # Only register mutation signatures for actual external mutation attempts (SIDE_EFFECT_COUNT > 0)
+                side_effects = result.get("SIDE_EFFECT_COUNT", 0)
+                if side_effects > 0:
+                    op_sig = result.get("IDEMPOTENCY_KEY") or result.get("ACTION_TAKEN", "MUTATION")
+                    self.loop_guard.record_cycle(operation_signature=op_sig)
+                else:
+                    # Read-only WAIT / IDLE cycles do not count as repeated mutating operations
+                    self.loop_guard.record_cycle(operation_signature=None)
 
                 self.logger.info(
                     f"Cycle {cycle_count}: Action={result.get('ACTION_TAKEN')}, SideEffects={result.get('SIDE_EFFECT_COUNT')}, Reason={result.get('REASON_CODE')}"

@@ -480,7 +480,68 @@ class RuntimeEngine:
                 TaskState.IMPLEMENTER_RESPONSE_DETECTED,
                 TaskState.IMPLEMENTER_RESPONSE_VALIDATED,
             ):
+                # Check PREPARED retry record reconciliation BEFORE evaluating general state
+                # Search both current task.retry_count AND task.retry_count + 1
+                retry_key_curr = f"idem_retry_{task.task_id}_{task.phase}_{task.retry_count}_{task.command_sha256}"
+                retry_key_next = f"idem_retry_{task.task_id}_{task.phase}_{task.retry_count + 1}_{task.command_sha256}"
+                existing_retry_rec = self.safety.idempotency.get_record(retry_key_curr) or self.safety.idempotency.get_record(retry_key_next)
+
                 gen_state, gen_details = await self.monitor.detect_state(aistudio_page)
+
+                if existing_retry_rec and existing_retry_rec.state == "PREPARED":
+                    if gen_state in (GenerationState.GENERATING, GenerationState.COMPLETED):
+                        self.safety.idempotency.record_operation(
+                            session_id=task.session_id,
+                            task_id=task.task_id,
+                            operation_id=existing_retry_rec.operation_id,
+                            idempotency_key=existing_retry_rec.idempotency_key,
+                            command_sha256=task.command_sha256,
+                            operation_type="GEMINI_RETRY",
+                            state="CONFIRMED",
+                        )
+                        if task.retry_count == 0:
+                            task.retry_count = 1
+                        if not dry_run:
+                            self.repo.save_active_task(task)
+
+                        await chrome.disconnect()
+                        return self._build_structured_result(
+                            status="SUCCESS",
+                            session_id=task.session_id,
+                            task_id=task.task_id,
+                            phase=task.phase,
+                            command_sha256=task.command_sha256,
+                            cycle_state="RETRY_RECONCILED_CONFIRMED",
+                            action_taken="RECONCILE_RETRY_RESUME",
+                            side_effect_count=0,
+                            state_mutations=1 if not dry_run else 0,
+                            reason_code="RETRY_PROVEN_EXECUTED",
+                            diagnostic="PREPARED retry click was independently proven executed. Resumed without duplicate click.",
+                        )
+                    else:
+                        task.transition_to(
+                            TaskState.MANUAL_REVIEW_REQUIRED,
+                            reason_code="AMBIGUOUS_RETRY_CRASH",
+                            error_message="Process crashed during GEMINI_RETRY PREPARED state. Retry outcome is ambiguous.",
+                        )
+                        if not dry_run:
+                            self.repo.save_active_task(task)
+                        await chrome.disconnect()
+                        return self._build_structured_result(
+                            status="HALTED",
+                            session_id=task.session_id,
+                            task_id=task.task_id,
+                            phase=task.phase,
+                            command_sha256=task.command_sha256,
+                            cycle_state="MANUAL_REVIEW_REQUIRED",
+                            action_taken="NONE",
+                            side_effect_count=0,
+                            reason_code="AMBIGUOUS_RETRY_CRASH",
+                            diagnostic="GEMINI_RETRY PREPARED crash was ambiguous. Halted for manual review.",
+                            manual_review_required=True,
+                            reconciliation_required=True,
+                            cycle_terminal=True,
+                        )
 
                 if gen_state == GenerationState.GENERATING:
                     await chrome.disconnect()
@@ -537,18 +598,18 @@ class RuntimeEngine:
                         cycle_terminal=True,
                     )
 
-                # Retry path for RETRY_AVAILABLE (Idempotent Operation Contract)
+                # Retry path for RETRY_AVAILABLE (Reconciled Idempotent Operation Contract)
                 if gen_state == GenerationState.RETRY_AVAILABLE:
+                    retry_attempt = task.retry_count + 1
+                    op_id = f"op_retry_{task.task_id}_{task.phase}_{retry_attempt}"
+                    idem_key = f"idem_retry_{task.task_id}_{task.phase}_{retry_attempt}_{task.command_sha256}"
+
                     can_r = self.retry_mgr.can_retry(
                         current_state=gen_state,
                         retry_count=task.retry_count,
                         response_text_exists=False,
                     )
                     if can_r:
-                        retry_attempt = task.retry_count + 1
-                        op_id = f"op_retry_{task.task_id}_{task.phase}_{retry_attempt}"
-                        idem_key = f"idem_retry_{task.task_id}_{task.phase}_{retry_attempt}_{task.command_sha256}"
-
                         contract = OperationContract(
                             session_id=task.session_id,
                             task_id=task.task_id,

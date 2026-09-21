@@ -23,15 +23,12 @@ class GenerationState(Enum):
 
 class GenerationMonitor:
     """
-    Monitors Gemini / AI Studio generation state using multi-signal detection:
-    - Network error banners -> NETWORK_FAILURE
-    - Error elements -> ERROR
-    - Stop button / progress indicator -> GENERATING
-    - Stopped indicator -> STOPPED
-    - Valid completed response -> COMPLETED (Strict precedence over Retry UI!)
-    - Retry button present + no completed response -> RETRY_AVAILABLE
-    - Zero turns + composer missing -> UNAVAILABLE
-    - Fallback -> UNCERTAIN
+    Monitors Gemini / AI Studio generation state using multi-signal detection with strict precedence:
+    1. NETWORK_FAILURE / ERROR
+    2. GENERATING (stop button or loading indicator present)
+    3. COMPLETED (valid model response text present in turns, INDEPENDENT of send button or retry UI!)
+    4. RETRY_AVAILABLE (retry button present and no valid completed response)
+    5. STOPPED / UNAVAILABLE / UNCERTAIN
     """
 
     def __init__(
@@ -83,34 +80,35 @@ class GenerationMonitor:
             "turns_count": turns_count,
         }
 
-        # Signal 1: Network failure banner
+        # Priority 1: Network failure banner
         if network_present:
             return GenerationState.NETWORK_FAILURE, details
 
-        # Signal 2: Explicit Error banner
+        # Priority 1b: Explicit Error banner
         if error_present:
             return GenerationState.ERROR, details
 
-        # Signal 3: Stop button or indicator active -> GENERATING
+        # Priority 2: Stop button or progress indicator active -> GENERATING
         if stop_present or indicator_present:
             return GenerationState.GENERATING, details
 
-        # Signal 4: Explicit Stopped indicator
-        if stopped_present and turns_count == 0:
-            return GenerationState.STOPPED, details
-
-        # Signal 5: Completed response check (COMPLETED STRICT PRECEDENCE!)
-        # If send_present and turns_count > 0, check latest response text
-        if send_present and turns_count > 0:
+        # Priority 3: COMPLETED MODEL RESPONSE (INDEPENDENT OF SEND BUTTON!)
+        # Check if conversation turns exist and latest turn has non-empty text
+        if turns_count > 0:
             latest_text = await adapter.extract_latest_response_text()
             if latest_text and len(latest_text.strip()) > 0:
+                # Valid completed response takes STRICT PRECEDENCE over retry controls!
                 return GenerationState.COMPLETED, details
 
-        # Signal 6: Retry button present and NO valid completed response
+        # Priority 4: Retry button present + no valid completed response
         if retry_present and not stop_present:
             return GenerationState.RETRY_AVAILABLE, details
 
-        # Signal 7: Unavailable
+        # Priority 5: Stopped indicator without output
+        if stopped_present and turns_count == 0:
+            return GenerationState.STOPPED, details
+
+        # Priority 6: Unavailable
         if not composer_present and turns_count == 0:
             return GenerationState.UNAVAILABLE, details
 
