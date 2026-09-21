@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supervisor_bridge"
+version = "0.1.0"
+description = "Deterministic Orchestration Engine connecting ChatGPT to Google AI Studio"
+authors = [{ name = "SupervisorBridge Team" }]
+dependencies = [
+    "playwright>=1.40.0",
+    "pyyaml>=6.0"
+]
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["."]

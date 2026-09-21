@@ -1,0 +1,17 @@
+chatgpt:
+  composer: "div#prompt-textarea, textarea[placeholder*='Send a message']"
+  send_button: "button[data-testid='send-button'], button[aria-label='Send prompt']"
+  message_turns: "article, div[data-message-author-role]"
+  assistant_messages: "article[data-testid*='assistant'], div[data-message-author-role='assistant']"
+  landmarks: "main, nav"
+
+ai_studio:
+  composer: "textarea, div[contenteditable='true'], ms-prompt-editor textarea"
+  send_button: "button.run-button, button[aria-label*='Run'], button[aria-label*='Send']"
+  stop_button: "button[aria-label*='Stop']"
+  conversation_turns: "div.turn, ms-chat-turn"
+  generation_indicator: ".loading-spinner, ms-progress-bar, [aria-busy='true']"
+  retry_button: "button[aria-label*='Retry'], button.retry-button, [data-testid='retry-button']"
+  error_message: ".error-message, ms-error-banner, .mat-error, [role='alert']"
+  stopped_indicator: ".generation-stopped, [data-state='stopped']"
+  network_error: ".network-error-banner, .offline-notice"

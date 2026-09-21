@@ -1,0 +1,29 @@
+cdp_url: "http://127.0.0.1:9222"
+
+timeouts:
+  connect_ms: 10000
+  navigation_ms: 15000
+  element_wait_ms: 5000
+  generation_timeout_sec: 180
+
+polling:
+  interval_sec: 2.0
+  stable_samples_required: 3
+
+limits:
+  max_retries: 3
+  max_loop_iterations: 10
+
+paths:
+  state_dir: "data/state"
+  logs_dir: "logs"
+
+logging:
+  level: "INFO"
+
+allowed_domains:
+  chatgpt:
+    - "chatgpt.com"
+    - "chat.openai.com"
+  ai_studio:
+    - "aistudio.google.com"
