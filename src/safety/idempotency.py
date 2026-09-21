@@ -94,17 +94,28 @@ class IdempotencyManager:
         return None
 
     def get_unfinished_prepared_record(
-        self, task_id: str, operation_type: str = "GEMINI_RETRY"
+        self,
+        session_id: str,
+        task_id: str,
+        phase: int,
+        command_sha256: str,
+        operation_type: str = "GEMINI_RETRY",
     ) -> Optional[IdempotencyRecord]:
         """
-        Searches durable idempotency records for any unfinished PREPARED operation for a given task_id and operation_type.
-        If multiple conflicting PREPARED records exist, raises IdempotencyViolationError (fails closed).
+        Searches durable idempotency records for an unfinished PREPARED operation for the exact task identity.
+        Fails closed with IdempotencyViolationError if PREPARED records exist for task_id with conflicting
+        session_id or command_sha256, or if multiple matching PREPARED records exist.
         """
         records = self.load_records()
         matches = []
         for raw in records.values():
             rec = IdempotencyRecord.from_dict(raw)
             if rec.task_id == task_id and rec.operation_type == operation_type and rec.state == "PREPARED":
+                if rec.session_id != session_id or rec.command_sha256 != command_sha256:
+                    raise IdempotencyViolationError(
+                        f"PREPARED '{operation_type}' record identity conflict for task '{task_id}'! "
+                        f"Session '{rec.session_id}' vs '{session_id}', SHA '{rec.command_sha256}' vs '{command_sha256}'."
+                    )
                 matches.append(rec)
 
         if len(matches) > 1:

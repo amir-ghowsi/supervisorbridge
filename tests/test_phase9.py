@@ -16,6 +16,7 @@ from src.safety.loop_guard import LoopGuardViolationError
 from src.safety.emergency_stop import EmergencyStopManager
 from src.protocol.supervisor_protocol import SupervisorCommand
 from src.protocol.implementer_protocol import ImplementerReport
+from src.adapters.ai_studio_adapter import AIStudioAdapter
 from src.diagnostics.state_inspector import StateInspector
 from src.utils.paths import get_project_root
 from src.utils.hashing import compute_sha256
@@ -87,6 +88,78 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         after = get_inventory()
 
         self.assertEqual(before, after)
+
+    # Blocker 1: Strict Retry Prepared Record Correlation
+    def test_get_unfinished_prepared_record_correlation(self):
+        idem = self.safety.idempotency
+
+        # 1. Exact match returns record
+        idem.record_operation(
+            session_id="sess-A",
+            task_id="TASK-A",
+            operation_id="op-retry-1",
+            idempotency_key="idem-retry-A",
+            command_sha256="sha-A",
+            operation_type="GEMINI_RETRY",
+            state="PREPARED",
+        )
+
+        rec = idem.get_unfinished_prepared_record(
+            session_id="sess-A",
+            task_id="TASK-A",
+            phase=1,
+            command_sha256="sha-A",
+            operation_type="GEMINI_RETRY",
+        )
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.idempotency_key, "idem-retry-A")
+
+        # 2. Conflicting session_id fails closed
+        with self.assertRaises(IdempotencyViolationError):
+            idem.get_unfinished_prepared_record(
+                session_id="sess-WRONG",
+                task_id="TASK-A",
+                phase=1,
+                command_sha256="sha-A",
+                operation_type="GEMINI_RETRY",
+            )
+
+        # 3. Conflicting command_sha256 fails closed
+        with self.assertRaises(IdempotencyViolationError):
+            idem.get_unfinished_prepared_record(
+                session_id="sess-A",
+                task_id="TASK-A",
+                phase=1,
+                command_sha256="sha-WRONG",
+                operation_type="GEMINI_RETRY",
+            )
+
+    # Blocker 2: AI Studio Role Verification
+    async def test_ai_studio_role_verification(self):
+        mock_page = AsyncMock()
+
+        # Mock user turn and model turn
+        mock_user_turn = AsyncMock()
+        mock_user_turn.inner_text.return_value = self.canonical_raw
+        mock_user_turn.evaluate.return_value = True  # is_user = True
+
+        mock_model_turn = AsyncMock()
+        mock_model_turn.inner_text.return_value = self.valid_report_text
+        mock_model_turn.evaluate.return_value = False  # is_user = False
+
+        async def mock_qs_all(sel):
+            if "model" in sel:
+                return [mock_model_turn]
+            if "turn" in sel:
+                return [mock_user_turn, mock_model_turn]
+            return []
+
+        mock_page.query_selector_all.side_effect = mock_qs_all
+
+        adapter = AIStudioAdapter(mock_page)
+        latest_response = await adapter.extract_latest_response_text()
+
+        self.assertEqual(latest_response, self.valid_report_text)
 
     # Blocker 9: Payload Integrity Tests
     def test_payload_integrity_raw_command_preservation(self):
@@ -210,9 +283,10 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         mock_page = AsyncMock()
         mock_turn = AsyncMock()
         mock_turn.inner_text.return_value = self.valid_report_text
+        mock_turn.evaluate.return_value = False
 
         async def mock_qs_all(sel):
-            if "turn" in sel:
+            if "model" in sel or "turn" in sel:
                 return [mock_turn]
             return []
 
@@ -242,7 +316,6 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         retry_op_id = f"op_retry_TASK-900_1_{retry_attempt}"
         retry_idem_key = f"idem_retry_TASK-900_1_{retry_attempt}_{cmd_sha}"
 
-        # Production state: task.retry_count = 1 saved on disk when attempt 1 is prepared/attempted
         task = ActiveTaskData(
             schema_version=CURRENT_SCHEMA_VERSION,
             task_id="TASK-900",
@@ -287,7 +360,6 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         async def mock_qs_all(sel):
             return []
 
-        # AI Studio generation is active (proven executed)
         mock_aistudio_page.query_selector.side_effect = lambda sel: AsyncMock() if "Stop" in sel or "retry" in sel else None
         mock_aistudio_page.query_selector_all.side_effect = mock_qs_all
 
@@ -332,7 +404,6 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         loop_ctrl = LoopController(runtime=self.runtime)
         loop_ctrl.poll_interval_sec = 0.001
 
-        # Run 5 iterations cleanly
         await loop_ctrl.run_loop(dry_run=False, max_cycles=5)
 
     # Scenarios 13-17: Identity field mismatches fail closed

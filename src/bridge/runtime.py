@@ -480,9 +480,13 @@ class RuntimeEngine:
                 TaskState.IMPLEMENTER_RESPONSE_DETECTED,
                 TaskState.IMPLEMENTER_RESPONSE_VALIDATED,
             ):
-                # Search for any unfinished PREPARED retry record belonging to the active task
+                # Search for any unfinished PREPARED retry record belonging to the exact active task identity
                 existing_prepared_retry = self.safety.idempotency.get_unfinished_prepared_record(
-                    task_id=task.task_id, operation_type="GEMINI_RETRY"
+                    session_id=task.session_id,
+                    task_id=task.task_id,
+                    phase=task.phase,
+                    command_sha256=task.command_sha256,
+                    operation_type="GEMINI_RETRY",
                 )
 
                 gen_state, gen_details = await self.monitor.detect_state(aistudio_page)
@@ -498,8 +502,6 @@ class RuntimeEngine:
                             operation_type="GEMINI_RETRY",
                             state="CONFIRMED",
                         )
-                        if task.retry_count == 0:
-                            task.retry_count = 1
                         if not dry_run:
                             self.repo.save_active_task(task)
 

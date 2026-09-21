@@ -119,18 +119,24 @@ class AIStudioAdapter(BaseAdapter):
             return None
 
     async def extract_latest_response_text(self) -> str:
-        """Extracts text content of the latest model/assistant turn in DOM order (excluding user prompts)."""
+        """Extracts text content of the latest model/assistant turn in DOM order (excluding user prompts and non-model turns)."""
         sel = self.selectors.get("ai_studio", {})
         turns_selector = sel.get("conversation_turns", "div.turn")
+        model_selector = "ms-chat-turn.model-turn, div.model-turn, ms-chat-turn[data-role='model'], div[data-role='model'], .model-response, .assistant-response"
         try:
             # First attempt explicit model turn selectors
-            model_turns = await self.page.query_selector_all("ms-chat-turn.model-turn, div.model-turn, ms-chat-turn[data-role='model'], div[data-role='model']")
+            model_turns = await self.page.query_selector_all(model_selector)
             if model_turns:
                 return await model_turns[-1].inner_text()
 
-            # Fallback: Scan general turns in reverse, excluding submitted user commands
+            # Fallback: Scan general turns in reverse, strictly rejecting user/prompt turns
             turns = await self.page.query_selector_all(turns_selector)
             for turn in reversed(turns):
+                # Evaluate class/attribute to reject explicit user turns
+                is_user = await turn.evaluate("el => el.classList.contains('user-turn') || el.getAttribute('data-role') === 'user' || el.getAttribute('data-message-author-role') === 'user'")
+                if is_user:
+                    continue
+
                 text = await turn.inner_text()
                 if text and "[SUPERVISOR]" not in text and "<<<SUPERVISOR_BRIDGE_COMMAND>>>" not in text:
                     return text
