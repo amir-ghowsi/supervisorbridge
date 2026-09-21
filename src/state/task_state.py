@@ -82,6 +82,7 @@ class ActiveTaskData:
     operation_id: str
     idempotency_key: str
     current_state: str
+    raw_canonical_block: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     submission_confirmed: bool = False

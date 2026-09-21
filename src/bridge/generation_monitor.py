@@ -28,8 +28,8 @@ class GenerationMonitor:
     - Error elements -> ERROR
     - Stop button / progress indicator -> GENERATING
     - Stopped indicator -> STOPPED
-    - Send button + turns count > 0 -> COMPLETED (Precedence over Retry UI!)
-    - Retry button present + no stop button -> RETRY_AVAILABLE
+    - Valid completed response -> COMPLETED (Strict precedence over Retry UI!)
+    - Retry button present + no completed response -> RETRY_AVAILABLE
     - Zero turns + composer missing -> UNAVAILABLE
     - Fallback -> UNCERTAIN
     """
@@ -96,19 +96,19 @@ class GenerationMonitor:
             return GenerationState.GENERATING, details
 
         # Signal 4: Explicit Stopped indicator
-        if stopped_present:
+        if stopped_present and turns_count == 0:
             return GenerationState.STOPPED, details
 
-        # Signal 5: Completed response (takes precedence over retry button!)
-        if send_present and turns_count > 0 and not retry_present:
-            return GenerationState.COMPLETED, details
+        # Signal 5: Completed response check (COMPLETED STRICT PRECEDENCE!)
+        # If send_present and turns_count > 0, check latest response text
+        if send_present and turns_count > 0:
+            latest_text = await adapter.extract_latest_response_text()
+            if latest_text and len(latest_text.strip()) > 0:
+                return GenerationState.COMPLETED, details
 
-        # Signal 6: Retry button present and no stop button
+        # Signal 6: Retry button present and NO valid completed response
         if retry_present and not stop_present:
             return GenerationState.RETRY_AVAILABLE, details
-
-        if send_present and turns_count > 0:
-            return GenerationState.COMPLETED, details
 
         # Signal 7: Unavailable
         if not composer_present and turns_count == 0:

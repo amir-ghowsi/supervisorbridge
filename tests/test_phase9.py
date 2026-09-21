@@ -40,6 +40,16 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
             "<<<END_SUPERVISOR_BRIDGE_COMMAND>>>"
         )
 
+        self.canonical_raw = (
+            "[SUPERVISOR]\n"
+            "TASK_ID: TASK-900\n"
+            "PHASE: 1\n"
+            "ACTION: EXECUTE\n"
+            "SEND_TO: GEMINI\n\n"
+            "Run Phase 9 Task.\n"
+            "[/SUPERVISOR]"
+        )
+
         self.valid_report_text = (
             "[IMPLEMENTER_REPORT]\n"
             "TASK_ID: TASK-900\n"
@@ -75,6 +85,64 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         after = get_inventory()
 
         self.assertEqual(before, after)
+
+    # Blocker 9: Payload Integrity Tests
+    def test_payload_integrity_raw_command_preservation(self):
+        cmd_sha = compute_sha256(self.canonical_raw)
+        task = ActiveTaskData(
+            schema_version=CURRENT_SCHEMA_VERSION,
+            task_id="TASK-900",
+            phase=1,
+            action="EXECUTE",
+            send_to="GEMINI",
+            command_sha256=cmd_sha,
+            session_id="sess-900",
+            operation_id="op-900",
+            idempotency_key="idem-900",
+            current_state=TaskState.SUBMISSION_PREPARED.value,
+            raw_canonical_block=self.canonical_raw,
+        )
+        self.repo.save_active_task(task)
+
+        loaded = self.repo.load_active_task()
+        self.assertEqual(loaded.raw_canonical_block, self.canonical_raw)
+        self.assertEqual(compute_sha256(loaded.raw_canonical_block), loaded.command_sha256)
+
+    # Failure Injection: Modified raw command block fails closed
+    @patch("src.bridge.runtime.TabManager")
+    @patch("src.bridge.runtime.ChromeManager")
+    async def test_payload_integrity_tampered_raw_block_fails_closed(
+        self, mock_chrome_cls, mock_tab_cls
+    ):
+        cmd_sha = compute_sha256(self.canonical_raw)
+        tampered_raw = self.canonical_raw + "\n# TAMPERED LINE"
+
+        task = ActiveTaskData(
+            schema_version=CURRENT_SCHEMA_VERSION,
+            task_id="TASK-900",
+            phase=1,
+            action="EXECUTE",
+            send_to="GEMINI",
+            command_sha256=cmd_sha,  # Store original sha
+            session_id="sess-900",
+            operation_id="op-900",
+            idempotency_key="idem-900",
+            current_state=TaskState.SUBMISSION_PREPARED.value,
+            raw_canonical_block=tampered_raw,  # Pass tampered block
+        )
+        self.repo.save_active_task(task)
+
+        repo2 = StateRepository(state_dir=self.state_dir)
+        safety2 = SafetyOrchestrator(state_dir=self.state_dir)
+        runtime2 = RuntimeEngine(repo=repo2, safety=safety2)
+
+        mock_chrome = AsyncMock()
+        mock_chrome_cls.return_value = mock_chrome
+
+        res = await runtime2.run_once(dry_run=False)
+        self.assertEqual(res["status"], "HALTED")
+        self.assertEqual(res["REASON_CODE"], "COMMAND_HASH_MISMATCH")
+        self.assertEqual(res["SIDE_EFFECT_COUNT"], 0)
 
     # Scenarios 1 & 2: Fresh submission & duplicate protection
     @patch("src.bridge.runtime.TabManager")
@@ -121,12 +189,10 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
 
         mock_aistudio_page.query_selector.side_effect = mock_ai_qs
 
-        # Cycle 1: Fresh submission
         res1 = await self.runtime.run_once(dry_run=False)
         self.assertEqual(res1["ACTION_TAKEN"], "FRESH_GEMINI_SUBMISSION")
         self.assertEqual(res1["SIDE_EFFECT_COUNT"], 1)
 
-        # Cycle 2: Invoked again while generating -> zero browser side effects
         mock_aistudio_page.query_selector.side_effect = lambda sel: AsyncMock() if "Stop" in sel else None
         res2 = await self.runtime.run_once(dry_run=False)
         self.assertEqual(res2["ACTION_TAKEN"], "WAIT_FOR_GENERATION")
@@ -173,17 +239,21 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
     async def test_failure_injection_command_accepted_progresses(
         self, mock_chrome_cls, mock_tab_cls
     ):
+        accept_raw = "[SUPERVISOR]\nTASK_ID: TASK-ACCEPT\nPHASE: 1\nACTION: EXECUTE\nSEND_TO: GEMINI\n[/SUPERVISOR]"
+        accept_sha = compute_sha256(accept_raw)
+
         task = ActiveTaskData(
             schema_version=CURRENT_SCHEMA_VERSION,
             task_id="TASK-ACCEPT",
             phase=1,
             action="EXECUTE",
             send_to="GEMINI",
-            command_sha256="sha-accept",
+            command_sha256=accept_sha,
             session_id="sess-accept",
             operation_id="op-accept",
             idempotency_key="idem_submit_sha-accept",
             current_state=TaskState.COMMAND_ACCEPTED.value,
+            raw_canonical_block=accept_raw,
         )
         self.repo.save_active_task(task)
 
@@ -196,7 +266,7 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         mock_tab.locate_ai_studio_tab.return_value = mock_aistudio_page
 
         mock_composer = AsyncMock()
-        mock_composer.input_value.return_value = "[SUPERVISOR]\nTASK_ID: TASK-ACCEPT\n[/SUPERVISOR]"
+        mock_composer.input_value.return_value = accept_raw
         mock_send_btn = AsyncMock()
 
         async def mock_ai_qs(sel):
@@ -205,31 +275,37 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
             return mock_send_btn
 
         mock_aistudio_page.query_selector.side_effect = mock_ai_qs
+        mock_aistudio_page.query_selector_all.return_value = []
 
-        # Should progress through SUBMISSION_PREPARED and submit command
         res = await self.runtime.run_once(dry_run=False)
         self.assertIn(res["status"], ("SUCCESS", "ERROR"))
         self.assertEqual(res["TASK_ID"], "TASK-ACCEPT")
 
-    # Failure Injection: SUBMISSION_PREPARED + ambiguous state
+    # Failure Injection: SUBMISSION_PREPARED + positive evidence in turns -> PROVEN_EXECUTED
     @patch("src.bridge.runtime.TabManager")
     @patch("src.bridge.runtime.ChromeManager")
-    async def test_failure_injection_submission_prepared_ambiguous(
+    async def test_submission_prepared_proven_executed_resumes(
         self, mock_chrome_cls, mock_tab_cls
     ):
+        cmd_sha = compute_sha256(self.canonical_raw)
         task = ActiveTaskData(
             schema_version=CURRENT_SCHEMA_VERSION,
-            task_id="TASK-SUB-PREP",
+            task_id="TASK-900",
             phase=1,
             action="EXECUTE",
             send_to="GEMINI",
-            command_sha256="sha-sub-prep",
-            session_id="sess-sub-prep",
-            operation_id="op-sub-prep",
-            idempotency_key="idem-sub-prep",
+            command_sha256=cmd_sha,
+            session_id="sess-900",
+            operation_id="op-900",
+            idempotency_key="idem-900",
             current_state=TaskState.SUBMISSION_PREPARED.value,
+            raw_canonical_block=self.canonical_raw,
         )
         self.repo.save_active_task(task)
+
+        repo2 = StateRepository(state_dir=self.state_dir)
+        safety2 = SafetyOrchestrator(state_dir=self.state_dir)
+        runtime2 = RuntimeEngine(repo=repo2, safety=safety2)
 
         mock_chrome = AsyncMock()
         mock_chrome_cls.return_value = mock_chrome
@@ -239,36 +315,140 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         mock_aistudio_page = AsyncMock()
         mock_tab.locate_ai_studio_tab.return_value = mock_aistudio_page
 
-        # DOM read error during reconciliation -> INSUFFICIENT_EVIDENCE -> HALTED
-        mock_aistudio_page.query_selector_all.side_effect = Exception("DOM read error")
+        mock_turn = AsyncMock()
+        mock_turn.inner_text.return_value = self.canonical_raw
+        mock_aistudio_page.query_selector_all.return_value = [mock_turn]
 
-        res = await self.runtime.run_once(dry_run=False)
+        res = await runtime2.run_once(dry_run=False)
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["ACTION_TAKEN"], "RECONCILE_SUBMISSION_RESUME")
+        self.assertEqual(res["SIDE_EFFECT_COUNT"], 0)
+
+        updated = repo2.load_active_task()
+        self.assertEqual(updated.get_state_enum(), TaskState.WAITING_FOR_IMPLEMENTER)
+
+    # Failure Injection: SUBMISSION_PREPARED + non-empty turns missing command -> INSUFFICIENT_EVIDENCE -> HALTED
+    @patch("src.bridge.runtime.TabManager")
+    @patch("src.bridge.runtime.ChromeManager")
+    async def test_submission_prepared_absence_fails_closed(
+        self, mock_chrome_cls, mock_tab_cls
+    ):
+        cmd_sha = compute_sha256(self.canonical_raw)
+        task = ActiveTaskData(
+            schema_version=CURRENT_SCHEMA_VERSION,
+            task_id="TASK-900",
+            phase=1,
+            action="EXECUTE",
+            send_to="GEMINI",
+            command_sha256=cmd_sha,
+            session_id="sess-900",
+            operation_id="op-900",
+            idempotency_key="idem-900",
+            current_state=TaskState.SUBMISSION_PREPARED.value,
+            raw_canonical_block=self.canonical_raw,
+        )
+        self.repo.save_active_task(task)
+
+        repo2 = StateRepository(state_dir=self.state_dir)
+        safety2 = SafetyOrchestrator(state_dir=self.state_dir)
+        runtime2 = RuntimeEngine(repo=repo2, safety=safety2)
+
+        mock_chrome = AsyncMock()
+        mock_chrome_cls.return_value = mock_chrome
+        mock_tab = AsyncMock()
+        mock_tab_cls.return_value = mock_tab
+
+        mock_aistudio_page = AsyncMock()
+        mock_tab.locate_ai_studio_tab.return_value = mock_aistudio_page
+
+        mock_unrelated_turn = AsyncMock()
+        mock_unrelated_turn.inner_text.return_value = "Unrelated previous task turn"
+        mock_aistudio_page.query_selector_all.return_value = [mock_unrelated_turn]
+
+        res = await runtime2.run_once(dry_run=False)
         self.assertEqual(res["status"], "HALTED")
         self.assertEqual(res["REASON_CODE"], "AMBIGUOUS_SUBMISSION_PREPARED")
         self.assertEqual(res["SIDE_EFFECT_COUNT"], 0)
 
-        updated = self.repo.load_active_task()
+        updated = repo2.load_active_task()
         self.assertEqual(updated.get_state_enum(), TaskState.MANUAL_REVIEW_REQUIRED)
 
-    # Failure Injection: RETURN_PREPARED + independently proven return
+    # Failure Injection: Role-Aware Return Reconciliation (USER message contains report)
     @patch("src.bridge.runtime.TabManager")
     @patch("src.bridge.runtime.ChromeManager")
-    async def test_failure_injection_return_prepared_proven_executed(
+    async def test_return_prepared_role_aware_user_message_reconciliation(
         self, mock_chrome_cls, mock_tab_cls
     ):
+        cmd_sha = compute_sha256(self.canonical_raw)
         task = ActiveTaskData(
             schema_version=CURRENT_SCHEMA_VERSION,
-            task_id="TASK-RET-PREP",
+            task_id="TASK-900",
             phase=1,
             action="EXECUTE",
             send_to="GEMINI",
-            command_sha256="sha-ret-prep",
-            session_id="sess-ret-prep",
-            operation_id="op-ret-prep",
-            idempotency_key="idem-ret-prep",
+            command_sha256=cmd_sha,
+            session_id="sess-900",
+            operation_id="op-900",
+            idempotency_key="idem-900",
             current_state=TaskState.RETURN_PREPARED.value,
+            raw_canonical_block=self.canonical_raw,
         )
         self.repo.save_active_task(task)
+
+        repo2 = StateRepository(state_dir=self.state_dir)
+        safety2 = SafetyOrchestrator(state_dir=self.state_dir)
+        runtime2 = RuntimeEngine(repo=repo2, safety=safety2)
+
+        mock_chrome = AsyncMock()
+        mock_chrome_cls.return_value = mock_chrome
+        mock_tab = AsyncMock()
+        mock_tab_cls.return_value = mock_tab
+
+        mock_chatgpt_page = AsyncMock()
+        mock_aistudio_page = AsyncMock()
+        mock_tab.locate_chatgpt_tab.return_value = mock_chatgpt_page
+        mock_tab.locate_ai_studio_tab.return_value = mock_aistudio_page
+
+        mock_user_msg = AsyncMock()
+        mock_user_msg.inner_text.return_value = self.valid_report_text
+        mock_chatgpt_page.query_selector_all.side_effect = lambda sel: [mock_user_msg] if "user" in sel else []
+
+        res = await runtime2.run_once(dry_run=False)
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertEqual(res["ACTION_TAKEN"], "RECONCILE_RETURN_FINALIZE")
+        self.assertEqual(res["SIDE_EFFECT_COUNT"], 0)
+
+        self.assertIsNone(repo2.load_active_task())
+        ledger = repo2.load_completed_ledger()
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["task_id"], "TASK-900")
+
+    # Failure Injection: Idempotent Retry with Operation Contract
+    @patch("src.bridge.runtime.TabManager")
+    @patch("src.bridge.runtime.ChromeManager")
+    async def test_gemini_retry_idempotency_and_contract(
+        self, mock_chrome_cls, mock_tab_cls
+    ):
+        cmd_sha = compute_sha256(self.canonical_raw)
+        task = ActiveTaskData(
+            schema_version=CURRENT_SCHEMA_VERSION,
+            task_id="TASK-900",
+            phase=1,
+            action="EXECUTE",
+            send_to="GEMINI",
+            command_sha256=cmd_sha,
+            session_id="sess-900",
+            operation_id="op-900",
+            idempotency_key="idem-900",
+            current_state=TaskState.WAITING_FOR_IMPLEMENTER.value,
+            raw_canonical_block=self.canonical_raw,
+            retry_count=0,
+        )
+        self.repo.save_active_task(task)
+
+        repo2 = StateRepository(state_dir=self.state_dir)
+        safety2 = SafetyOrchestrator(state_dir=self.state_dir)
+        runtime2 = RuntimeEngine(repo=repo2, safety=safety2)
 
         mock_chrome = AsyncMock()
         mock_chrome_cls.return_value = mock_chrome
@@ -276,23 +456,26 @@ class TestPhase9RecoveryAndFailureInjection(unittest.IsolatedAsyncioTestCase):
         mock_tab_cls.return_value = mock_tab
 
         mock_aistudio_page = AsyncMock()
-        mock_chatgpt_page = AsyncMock()
         mock_tab.locate_ai_studio_tab.return_value = mock_aistudio_page
-        mock_tab.locate_chatgpt_tab.return_value = mock_chatgpt_page
 
-        mock_chatgpt_page.query_selector_all.return_value = [
-            AsyncMock(inner_text=AsyncMock(return_value="[IMPLEMENTER_REPORT]\nTASK_ID: TASK-RET-PREP\n[/IMPLEMENTER_REPORT]"))
-        ]
+        mock_retry_btn = AsyncMock()
 
-        res = await self.runtime.run_once(dry_run=False)
+        async def mock_qs(sel):
+            if "retry" in sel.lower():
+                return mock_retry_btn
+            return None
+
+        mock_aistudio_page.query_selector.side_effect = mock_qs
+        mock_aistudio_page.query_selector_all.return_value = []
+
+        res = await runtime2.run_once(dry_run=False)
         self.assertEqual(res["status"], "SUCCESS")
-        self.assertEqual(res["ACTION_TAKEN"], "RECONCILE_RETURN_FINALIZE")
-        self.assertEqual(res["SIDE_EFFECT_COUNT"], 0)
+        self.assertEqual(res["ACTION_TAKEN"], "GEMINI_RETRY")
+        self.assertEqual(res["SIDE_EFFECT_COUNT"], 1)
+        mock_retry_btn.click.assert_called_once()
 
-        self.assertIsNone(self.repo.load_active_task())
-        ledger = self.repo.load_completed_ledger()
-        self.assertEqual(len(ledger), 1)
-        self.assertEqual(ledger[0]["task_id"], "TASK-RET-PREP")
+        updated = repo2.load_active_task()
+        self.assertEqual(updated.retry_count, 1)
 
     # Scenarios 13-17: Identity field mismatches fail closed
     def test_scenarios_13_17_identity_mismatches_fail_closed(self):

@@ -7,6 +7,7 @@ from src.adapters.chatgpt_adapter import ChatGPTAdapter
 from src.adapters.ai_studio_adapter import AIStudioAdapter
 from src.protocol.message_parser import MessageParser
 from src.protocol.supervisor_protocol import SupervisorCommand
+from src.bridge.operation_contract import OperationContract
 from src.state.task_state import TaskState, ActiveTaskData, CURRENT_SCHEMA_VERSION
 from src.state.state_repository import StateRepository, CorruptStateError, SchemaMismatchError
 from src.state.recovery import ReconciliationEngine, ReconciliationOutcome
@@ -17,6 +18,7 @@ from src.bridge.response_inspector import ResponseInspector
 from src.bridge.return_to_supervisor import SupervisorReturner
 from src.utils.logger import get_logger
 from src.utils.config_loader import get_config
+from src.utils.hashing import compute_sha256
 
 
 class RuntimeEngine:
@@ -230,6 +232,32 @@ class RuntimeEngine:
                     cycle_terminal=True,
                 )
 
+            # Raw Command Integrity Assertion: Verify SHA256 matches
+            if task.raw_canonical_block:
+                computed_hash = compute_sha256(task.raw_canonical_block)
+                if computed_hash != task.command_sha256:
+                    task.transition_to(
+                        TaskState.MANUAL_REVIEW_REQUIRED,
+                        reason_code="COMMAND_HASH_MISMATCH",
+                        error_message=f"Persisted raw_canonical_block SHA256 mismatch! '{computed_hash}' vs '{task.command_sha256}'",
+                    )
+                    if not dry_run:
+                        self.repo.save_active_task(task)
+                    return self._build_structured_result(
+                        status="HALTED",
+                        session_id=task.session_id,
+                        task_id=task.task_id,
+                        phase=task.phase,
+                        command_sha256=task.command_sha256,
+                        cycle_state="COMMAND_HASH_MISMATCH",
+                        action_taken="NONE",
+                        reason_code="COMMAND_HASH_MISMATCH",
+                        diagnostic="Persisted raw command block SHA256 does not match command_sha256 header.",
+                        manual_review_required=True,
+                        reconciliation_required=True,
+                        cycle_terminal=True,
+                    )
+
         chrome = ChromeManager()
         try:
             browser = await chrome.connect()
@@ -269,6 +297,7 @@ class RuntimeEngine:
                     operation_id=operation_id,
                     idempotency_key=idempotency_key,
                     current_state=TaskState.COMMAND_DETECTED.value,
+                    raw_canonical_block=cmd.raw_canonical_block,  # Persist exact raw canonical command!
                 )
 
                 if not dry_run:
@@ -327,7 +356,7 @@ class RuntimeEngine:
                 outcome = self.reconciler.reconcile_submission_prepared(
                     task=task,
                     ai_studio_turns=full_turns_text,
-                    expected_raw_command=task.task_id,
+                    expected_raw_command=task.raw_canonical_block or task.task_id,
                 )
 
                 if outcome == ReconciliationOutcome.PROVEN_EXECUTED:
@@ -351,8 +380,7 @@ class RuntimeEngine:
                         reason_code="SUBMISSION_PROVEN_EXECUTED",
                         diagnostic="Submission was independently proven in AI Studio turns. Resumed without duplicate submit.",
                     )
-                elif outcome == ReconciliationOutcome.PROVEN_NOT_EXECUTED:
-                    # Non-execution proven cleanly -> attempt submission
+                elif outcome == ReconciliationOutcome.PROVEN_NOT_EXECUTED and task.raw_canonical_block:
                     cmd = SupervisorCommand(
                         task_id=task.task_id,
                         phase=task.phase,
@@ -361,7 +389,7 @@ class RuntimeEngine:
                         zip_required=False,
                         headers={},
                         body="",
-                        raw_canonical_block=f"[SUPERVISOR]\nTASK_ID: {task.task_id}\nPHASE: {task.phase}\nACTION: {task.action}\nSEND_TO: {task.send_to}\n[/SUPERVISOR]",
+                        raw_canonical_block=task.raw_canonical_block,
                         command_sha256=task.command_sha256,
                     )
                     success, effects, details = await self.submitter.submit_command(
@@ -415,11 +443,11 @@ class RuntimeEngine:
             if task.get_state_enum() == TaskState.RETURN_PREPARED:
                 chatgpt_page = await tab_mgr.locate_chatgpt_tab()
                 chatgpt_adapter = ChatGPTAdapter(chatgpt_page)
-                cg_messages = await chatgpt_adapter.extract_raw_assistant_messages()
+                cg_user_messages = await chatgpt_adapter.extract_raw_user_messages()
 
                 outcome = self.reconciler.reconcile_return_prepared(
                     task=task,
-                    chatgpt_messages=cg_messages,
+                    chatgpt_user_messages=cg_user_messages,
                 )
 
                 if outcome in (ReconciliationOutcome.PROVEN_EXECUTED, ReconciliationOutcome.PROVEN_COMPLETED):
@@ -441,7 +469,7 @@ class RuntimeEngine:
                         side_effect_count=0,
                         state_mutations=1 if not dry_run else 0,
                         reason_code="RETURN_PROVEN_EXECUTED",
-                        diagnostic="Return was independently proven in ChatGPT messages. Finalized task.",
+                        diagnostic="Return was independently proven in ChatGPT USER messages. Finalized task.",
                         cycle_terminal=True,
                     )
 
@@ -509,7 +537,7 @@ class RuntimeEngine:
                         cycle_terminal=True,
                     )
 
-                # Retry path for RETRY_AVAILABLE
+                # Retry path for RETRY_AVAILABLE (Idempotent Operation Contract)
                 if gen_state == GenerationState.RETRY_AVAILABLE:
                     can_r = self.retry_mgr.can_retry(
                         current_state=gen_state,
@@ -517,15 +545,33 @@ class RuntimeEngine:
                         response_text_exists=False,
                     )
                     if can_r:
-                        task.retry_count += 1
+                        retry_attempt = task.retry_count + 1
+                        op_id = f"op_retry_{task.task_id}_{task.phase}_{retry_attempt}"
+                        idem_key = f"idem_retry_{task.task_id}_{task.phase}_{retry_attempt}_{task.command_sha256}"
+
+                        contract = OperationContract(
+                            session_id=task.session_id,
+                            task_id=task.task_id,
+                            phase=task.phase,
+                            operation_id=op_id,
+                            idempotency_key=idem_key,
+                            command_sha256=task.command_sha256,
+                            operation_type="GEMINI_RETRY",
+                            payload=f"RETRY_{retry_attempt}",
+                        )
+
+                        if not dry_run:
+                            self.safety.prepare_operation(contract, task.to_dict())
+
+                        task.retry_count = retry_attempt
                         if not dry_run:
                             self.repo.save_active_task(task)
 
-                        # Single safe retry click
                         sel = get_config().selectors.get("ai_studio", {})
                         retry_btn = await aistudio_page.query_selector(sel.get("retry_button", "button.retry"))
                         if retry_btn and not dry_run:
                             await retry_btn.click()
+                            self.safety.confirm_operation(contract, task.to_dict())
 
                         await chrome.disconnect()
                         return self._build_structured_result(
@@ -534,12 +580,14 @@ class RuntimeEngine:
                             task_id=task.task_id,
                             phase=task.phase,
                             command_sha256=task.command_sha256,
+                            operation_id=op_id,
+                            idempotency_key=idem_key,
                             cycle_state="RETRY_PERFORMED",
                             action_taken="GEMINI_RETRY",
                             side_effect_count=1 if not dry_run else 0,
                             state_mutations=1 if not dry_run else 0,
                             reason_code="RETRY_EXECUTED",
-                            diagnostic=f"Executed safe retry {task.retry_count}.",
+                            diagnostic=f"Executed safe retry attempt {retry_attempt}.",
                         )
 
             await chrome.disconnect()

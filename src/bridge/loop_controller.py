@@ -29,11 +29,12 @@ class LoopController:
                 break
 
             try:
-                # Record cycle with loop guard
-                action_sig = f"cycle_{cycle_count}"
-                self.loop_guard.record_cycle(operation_signature=action_sig)
-
                 result = await self.runtime.run_once(dry_run=dry_run)
+
+                # Record operation signature with loop guard to detect infinite repeated identical operations
+                op_sig = result.get("IDEMPOTENCY_KEY") or result.get("ACTION_TAKEN", "NONE")
+                self.loop_guard.record_cycle(operation_signature=op_sig)
+
                 self.logger.info(
                     f"Cycle {cycle_count}: Action={result.get('ACTION_TAKEN')}, SideEffects={result.get('SIDE_EFFECT_COUNT')}, Reason={result.get('REASON_CODE')}"
                 )

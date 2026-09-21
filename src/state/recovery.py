@@ -49,27 +49,32 @@ class ReconciliationEngine:
         except Exception:
             return ReconciliationOutcome.CONFLICTING_EVIDENCE
 
-        if ai_studio_turns is not None:
+        # Check positive evidence in turns
+        if ai_studio_turns:
             for turn in ai_studio_turns:
                 if (expected_raw_command and expected_raw_command in turn) or task.task_id in turn:
                     return ReconciliationOutcome.PROVEN_EXECUTED
-            return ReconciliationOutcome.PROVEN_NOT_EXECUTED
 
         rec = self.idempotency.get_record(task.idempotency_key)
         if rec and rec.state == "CONFIRMED":
             return ReconciliationOutcome.PROVEN_EXECUTED
 
+        # If no idempotency record / checkpoint AND zero turns exist in conversation -> PROVEN_NOT_EXECUTED
+        if (not rec or rec.state != "CONFIRMED") and (ai_studio_turns is not None and len(ai_studio_turns) == 0):
+            return ReconciliationOutcome.PROVEN_NOT_EXECUTED
+
+        # Absence alone in non-empty conversation does not prove non-execution -> Fail closed with INSUFFICIENT_EVIDENCE
         return ReconciliationOutcome.INSUFFICIENT_EVIDENCE
 
     def reconcile_return_prepared(
         self,
         task: ActiveTaskData,
-        chatgpt_messages: Optional[List[str]] = None,
+        chatgpt_user_messages: Optional[List[str]] = None,
         expected_report_block: Optional[str] = None,
     ) -> ReconciliationOutcome:
         """
         Reconciles RETURN_PREPARED state or ambiguous return click.
-        Checks if Implementer Report was already posted to ChatGPT.
+        Checks if Implementer Report was already posted to ChatGPT in a USER-role message.
         """
         try:
             ledger = self.repo.load_completed_ledger()
@@ -78,15 +83,17 @@ class ReconciliationEngine:
         except Exception:
             return ReconciliationOutcome.CONFLICTING_EVIDENCE
 
-        if chatgpt_messages is not None:
-            for msg in chatgpt_messages:
+        if chatgpt_user_messages:
+            for msg in chatgpt_user_messages:
                 if (expected_report_block and expected_report_block in msg) or (task.task_id in msg and "[IMPLEMENTER_REPORT]" in msg):
                     return ReconciliationOutcome.PROVEN_EXECUTED
-            return ReconciliationOutcome.PROVEN_NOT_EXECUTED
 
         rec = self.idempotency.get_record(f"idem_return_{task.task_id}_{task.phase}_{task.command_sha256}")
         if rec and rec.state == "CONFIRMED":
             return ReconciliationOutcome.PROVEN_EXECUTED
+
+        if (not rec or rec.state != "CONFIRMED") and (chatgpt_user_messages is not None and len(chatgpt_user_messages) == 0):
+            return ReconciliationOutcome.PROVEN_NOT_EXECUTED
 
         return ReconciliationOutcome.INSUFFICIENT_EVIDENCE
 

@@ -71,3 +71,15 @@ class ChatGPTAdapter(BaseAdapter):
         except Exception as e:
             self.logger.error(f"Failed to extract assistant messages: {e}")
         return results
+
+    async def extract_raw_user_messages(self) -> List[str]:
+        """Extracts text content of all user-authored message elements in DOM order."""
+        user_selector = "article[data-testid*='user'], div[data-message-author-role='user'], div.user-message"
+        results = []
+        try:
+            msgs = await self.page.query_selector_all(user_selector)
+            for msg in msgs:
+                results.append(await msg.inner_text())
+        except Exception as e:
+            self.logger.error(f"Failed to extract user messages: {e}")
+        return results
